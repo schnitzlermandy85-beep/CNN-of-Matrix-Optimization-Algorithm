@@ -50,6 +50,17 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = True
 
 
+def sync_device(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def autocast_context(device, enabled):
+    if enabled and device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return torch.autocast(device_type=device.type, enabled=False)
+
+
 class BasicBlock(nn.Module):
     expansion = 1
 
@@ -85,8 +96,8 @@ class CIFARResNet(nn.Module):
     """
     A moderately larger CIFAR model.
 
-    With width=64 and blocks=(3, 3, 3, 3), it has roughly 11M parameters.
-    Use width=32 for fast smoke tests.
+    With width=64 and blocks=(3, 3, 3, 3), it has about 17M parameters.
+    Use width=16 or width=32 for fast smoke tests.
     """
 
     def __init__(self, num_classes, width=64, blocks=(3, 3, 3, 3), dropout=0.05):
@@ -351,7 +362,7 @@ def build_optimizer(name, model, args):
     raise ValueError(f"Unknown optimizer: {name}")
 
 
-def get_transforms(dataset):
+def get_transforms(dataset, aug='auto', fake_data=False):
     if dataset == "cifar10":
         mean, std = CIFAR10_MEAN, CIFAR10_STD
     elif dataset == "cifar100":
@@ -359,16 +370,30 @@ def get_transforms(dataset):
     else:
         raise ValueError(dataset)
 
-    train_transform = transforms.Compose(
-        [
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10),
-            transforms.ToTensor(),
-            transforms.Normalize(mean, std),
-            transforms.RandomErasing(p=0.20, scale=(0.02, 0.12), ratio=(0.3, 3.3)),
-        ]
-    )
+    if aug == "auto":
+        aug = "simple" if fake_data else "strong"
+
+    if aug == "simple":
+        train_transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ]
+        )
+    elif aug == "strong":
+        train_transform = transforms.Compose(
+            [
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+                transforms.RandomErasing(p=0.20, scale=(0.02, 0.12), ratio=(0.3, 3.3)),
+            ]
+        )
+    else:
+        raise ValueError(f"Unknown augmentation mode: {aug}")
+
     test_transform = transforms.Compose(
         [
             transforms.ToTensor(),
@@ -378,7 +403,7 @@ def get_transforms(dataset):
     return train_transform, test_transform
 
 
-def load_data(dataset, batch_size, data_dir, num_workers, fake_data=False):
+def load_data(dataset, batch_size, data_dir, num_workers, fake_data=False, aug='auto'):
     if dataset == "cifar10":
         dataset_cls = torchvision.datasets.CIFAR10
         num_classes = 10
@@ -388,7 +413,7 @@ def load_data(dataset, batch_size, data_dir, num_workers, fake_data=False):
     else:
         raise ValueError(f"Unsupported dataset: {dataset}")
 
-    train_transform, test_transform = get_transforms(dataset)
+    train_transform, test_transform = get_transforms(dataset, aug=aug, fake_data=fake_data)
     if fake_data:
         train_set = torchvision.datasets.FakeData(
             size=512,
@@ -416,6 +441,7 @@ def load_data(dataset, batch_size, data_dir, num_workers, fake_data=False):
         shuffle=True,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
     )
     test_loader = DataLoader(
         test_set,
@@ -423,6 +449,7 @@ def load_data(dataset, batch_size, data_dir, num_workers, fake_data=False):
         shuffle=False,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
     )
     return train_loader, test_loader, num_classes
 
@@ -462,6 +489,21 @@ def current_lrs(optimizer, name):
     return f"muon={optimizer.lr:.6g}, adamw={optimizer.adamw.lr:.6g}"
 
 
+def optimizer_base_lr(name, args):
+    if name == "sgd":
+        return args.sgd_lr
+    if name == "adamw":
+        return args.adamw_lr
+    return args.muon_lr
+
+
+def grads_are_finite(model):
+    for p in model.parameters():
+        if p.grad is not None and not torch.isfinite(p.grad).all():
+            return False
+    return True
+
+
 def train_one_epoch(
     model,
     loader,
@@ -469,12 +511,16 @@ def train_one_epoch(
     optimizer,
     device,
     limit_batches=None,
+    amp=False,
+    grad_clip=0.0,
+    fail_on_nan=False,
 ):
     model.train()
     total_loss = 0.0
     correct = 0
     total = 0
     num_batches = 0
+    skipped_batches = 0
 
     for batch_idx, (inputs, targets) in enumerate(loader):
         if limit_batches is not None and batch_idx >= limit_batches:
@@ -483,9 +529,32 @@ def train_one_epoch(
         targets = targets.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
+        with autocast_context(device, amp):
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+
+        if not torch.isfinite(loss):
+            skipped_batches += 1
+            if fail_on_nan:
+                raise FloatingPointError(f"Non-finite loss at batch {batch_idx}: {loss.item()}")
+            continue
+
         loss.backward()
+        if grad_clip > 0:
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            if not torch.isfinite(grad_norm):
+                skipped_batches += 1
+                if fail_on_nan:
+                    raise FloatingPointError(f"Non-finite grad norm at batch {batch_idx}: {grad_norm}")
+                optimizer.zero_grad()
+                continue
+        elif not grads_are_finite(model):
+            skipped_batches += 1
+            if fail_on_nan:
+                raise FloatingPointError(f"Non-finite gradients at batch {batch_idx}")
+            optimizer.zero_grad()
+            continue
+
         optimizer.step()
 
         total_loss += loss.item()
@@ -494,11 +563,15 @@ def train_one_epoch(
         correct += predicted.eq(targets).sum().item()
         num_batches += 1
 
-    return total_loss / max(1, num_batches), 100.0 * correct / max(1, total)
+    return (
+        total_loss / max(1, num_batches),
+        100.0 * correct / max(1, total),
+        skipped_batches,
+    )
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device, limit_batches=None):
+def evaluate(model, loader, criterion, device, limit_batches=None, amp=False):
     model.eval()
     total_loss = 0.0
     correct = 0
@@ -510,8 +583,9 @@ def evaluate(model, loader, criterion, device, limit_batches=None):
             break
         inputs = inputs.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
+        with autocast_context(device, amp):
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
 
         total_loss += loss.item()
         predicted = outputs.argmax(dim=1)
@@ -525,7 +599,7 @@ def evaluate(model, loader, criterion, device, limit_batches=None):
 def cuda_memory_mb(device):
     if device.type != "cuda":
         return 0.0
-    torch.cuda.synchronize(device)
+    sync_device(device)
     return torch.cuda.max_memory_allocated(device) / (1024 ** 2)
 
 
@@ -542,6 +616,24 @@ class RunResult:
     elapsed_time: float
     peak_memory_mb: float
     lr: str
+    skipped_batches: int
+
+
+def run_warmup(model, train_loader, criterion, optimizer, device, args):
+    if device.type != "cuda" or args.cuda_warmup_batches <= 0:
+        return
+    train_one_epoch(
+        model,
+        train_loader,
+        criterion,
+        optimizer,
+        device,
+        limit_batches=args.cuda_warmup_batches,
+        amp=args.amp,
+        grad_clip=args.grad_clip,
+        fail_on_nan=args.fail_on_nan,
+    )
+    sync_device(device)
 
 
 def run_one_experiment(dataset, optimizer_name, base_state, args, device, output_dir):
@@ -551,6 +643,7 @@ def run_one_experiment(dataset, optimizer_name, base_state, args, device, output
         data_dir=args.data_dir,
         num_workers=args.num_workers,
         fake_data=args.fake_data,
+        aug=args.aug,
     )
     model = CIFARResNet(
         num_classes=num_classes,
@@ -563,6 +656,10 @@ def run_one_experiment(dataset, optimizer_name, base_state, args, device, output
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     optimizer = build_optimizer(optimizer_name, model, args)
 
+    run_warmup(model, train_loader, criterion, optimizer, device, args)
+    model.load_state_dict(copy.deepcopy(base_state[num_classes]))
+    optimizer = build_optimizer(optimizer_name, model, args)
+    sync_device(device)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
@@ -572,23 +669,22 @@ def run_one_experiment(dataset, optimizer_name, base_state, args, device, output
     for epoch in range(1, args.epochs + 1):
         reset_optimizer_lr(optimizer, optimizer_name, args)
         if args.cosine_lr:
-            if optimizer_name == "sgd":
-                base_lr = args.sgd_lr
-            elif optimizer_name == "adamw":
-                base_lr = args.adamw_lr
-            else:
-                base_lr = args.muon_lr
+            base_lr = optimizer_base_lr(optimizer_name, args)
             lr = cosine_lr(base_lr, epoch, args.epochs, warmup_epochs=args.warmup_epochs)
             set_optimizer_lr(optimizer, optimizer_name, lr / base_lr)
 
+        sync_device(device)
         epoch_start = time.time()
-        train_loss, train_acc = train_one_epoch(
+        train_loss, train_acc, skipped = train_one_epoch(
             model,
             train_loader,
             criterion,
             optimizer,
             device,
             limit_batches=args.limit_train_batches,
+            amp=args.amp,
+            grad_clip=args.grad_clip,
+            fail_on_nan=args.fail_on_nan,
         )
         test_loss, test_acc = evaluate(
             model,
@@ -596,7 +692,9 @@ def run_one_experiment(dataset, optimizer_name, base_state, args, device, output
             criterion,
             device,
             limit_batches=args.limit_test_batches,
+            amp=args.amp,
         )
+        sync_device(device)
         epoch_time = time.time() - epoch_start
         elapsed_time = time.time() - start
         peak_memory = cuda_memory_mb(device)
@@ -614,13 +712,15 @@ def run_one_experiment(dataset, optimizer_name, base_state, args, device, output
             elapsed_time=elapsed_time,
             peak_memory_mb=peak_memory,
             lr=current_lrs(optimizer, optimizer_name),
+            skipped_batches=skipped,
         )
         rows.append(row)
 
         print(
             f"{dataset:8s} | {optimizer_name:10s} | epoch {epoch:03d}/{args.epochs:03d} | "
             f"train loss {train_loss:.4f} | train acc {train_acc:6.2f}% | "
-            f"test acc {test_acc:6.2f}% | {epoch_time:6.1f}s | peak {peak_memory:7.1f} MB | "
+            f"test loss {test_loss:.4f} | test acc {test_acc:6.2f}% | "
+            f"{epoch_time:6.1f}s | peak {peak_memory:7.1f} MB | skipped {skipped:2d} | "
             f"lr {row.lr}"
         )
 
@@ -642,6 +742,48 @@ def save_csv(rows, output_dir):
     print(f"Saved metrics: {path}")
 
 
+def summarize_rows(rows):
+    summary = []
+    grouped = {}
+    for row in rows:
+        grouped.setdefault((row.dataset, row.optimizer), []).append(row)
+    for (dataset, optimizer), opt_rows in grouped.items():
+        opt_rows = sorted(opt_rows, key=lambda r: r.epoch)
+        best = max(opt_rows, key=lambda r: r.test_acc)
+        final = opt_rows[-1]
+        first_loss = opt_rows[0].train_loss
+        final_loss = final.train_loss
+        summary.append(
+            {
+                "dataset": dataset,
+                "optimizer": optimizer,
+                "best_epoch": best.epoch,
+                "best_test_acc": best.test_acc,
+                "final_test_acc": final.test_acc,
+                "final_train_loss": final.train_loss,
+                "train_loss_drop": first_loss - final_loss,
+                "total_time": final.elapsed_time,
+                "avg_epoch_time": sum(r.epoch_time for r in opt_rows) / len(opt_rows),
+                "peak_memory_mb": max(r.peak_memory_mb for r in opt_rows),
+                "skipped_batches": sum(r.skipped_batches for r in opt_rows),
+            }
+        )
+    return summary
+
+
+def save_summary(rows, output_dir):
+    summary = summarize_rows(rows)
+    if not summary:
+        return
+    path = output_dir / "summary.csv"
+    fieldnames = list(summary[0].keys())
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(summary)
+    print(f"Saved summary: {path}")
+
+
 def plot_results(rows, output_dir):
     if not rows:
         return
@@ -650,31 +792,52 @@ def plot_results(rows, output_dir):
         grouped.setdefault(row.dataset, {}).setdefault(row.optimizer, []).append(row)
 
     for dataset, by_optimizer in grouped.items():
-        fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+        fig, axes = plt.subplots(2, 3, figsize=(17, 9))
+        axes = axes.ravel()
+        best_labels = []
+        best_values = []
+
         for optimizer_name, opt_rows in by_optimizer.items():
             opt_rows = sorted(opt_rows, key=lambda r: r.epoch)
             epochs = [r.epoch for r in opt_rows]
             axes[0].plot(epochs, [r.train_loss for r in opt_rows], marker="o", label=optimizer_name)
-            axes[1].plot(epochs, [r.test_acc for r in opt_rows], marker="o", label=optimizer_name)
+            axes[1].plot(epochs, [r.test_loss for r in opt_rows], marker="o", label=optimizer_name)
+            axes[2].plot(epochs, [r.train_acc for r in opt_rows], marker="o", linestyle="--", label=f"{optimizer_name} train")
+            axes[2].plot(epochs, [r.test_acc for r in opt_rows], marker="o", label=f"{optimizer_name} test")
+            axes[3].plot(epochs, [r.epoch_time for r in opt_rows], marker="o", label=optimizer_name)
+            axes[4].plot(epochs, [r.peak_memory_mb for r in opt_rows], marker="o", label=optimizer_name)
+            best_labels.append(optimizer_name)
+            best_values.append(max(r.test_acc for r in opt_rows))
 
-        axes[0].set_title(f"{dataset.upper()} Train Loss")
-        axes[0].set_xlabel("Epoch")
-        axes[0].set_ylabel("Loss")
-        axes[0].grid(True, alpha=0.3)
+        titles = [
+            f"{dataset.upper()} Train Loss",
+            f"{dataset.upper()} Test Loss",
+            f"{dataset.upper()} Accuracy",
+            "Epoch Time",
+            "Peak CUDA Memory",
+            "Best Test Accuracy",
+        ]
+        ylabels = ["Loss", "Loss", "Accuracy (%)", "Seconds", "MB", "Accuracy (%)"]
+        for ax, title, ylabel in zip(axes, titles, ylabels):
+            ax.set_title(title)
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel(ylabel)
+            ax.grid(True, alpha=0.3)
+
+        axes[5].bar(best_labels, best_values, color=["#4c78a8", "#f58518", "#54a24b"][: len(best_labels)])
+        for idx, value in enumerate(best_values):
+            axes[5].text(idx, value, f"{value:.2f}%", ha="center", va="bottom", fontsize=9)
         axes[0].legend()
-
-        axes[1].set_title(f"{dataset.upper()} Test Accuracy")
-        axes[1].set_xlabel("Epoch")
-        axes[1].set_ylabel("Accuracy (%)")
-        axes[1].grid(True, alpha=0.3)
         axes[1].legend()
+        axes[2].legend(fontsize=8)
+        axes[3].legend()
+        axes[4].legend()
 
         fig.tight_layout()
-        path = output_dir / f"{dataset}_optimizer_comparison.png"
-        fig.savefig(path, dpi=160, bbox_inches="tight")
+        path = output_dir / f"{dataset}_optimizer_comparison_detailed.png"
+        fig.savefig(path, dpi=170, bbox_inches="tight")
         plt.close(fig)
-        print(f"Saved plot: {path}")
-
+        print(f"Saved detailed plot: {path}")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="CIFAR-10/100 manual optimizer comparison")
@@ -696,6 +859,11 @@ def parse_args():
     parser.add_argument("--blocks", nargs=4, type=int, default=[3, 3, 3, 3])
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument("--label-smoothing", type=float, default=0.0)
+    parser.add_argument("--aug", default="auto", choices=["auto", "simple", "strong"], help="auto uses simple augmentation for fake data and strong augmentation for real data")
+    parser.add_argument("--amp", action="store_true", help="Use CUDA bfloat16 autocast to reduce memory and speed up training")
+    parser.add_argument("--cuda-warmup-batches", type=int, default=1, help="Warm up CUDA before measured training for fairer timing")
+    parser.add_argument("--grad-clip", type=float, default=0.0, help="Clip gradient norm when > 0")
+    parser.add_argument("--fail-on-nan", action="store_true", help="Raise immediately if loss or gradients become non-finite")
 
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--sgd-lr", type=float, default=0.05)
@@ -711,7 +879,6 @@ def parse_args():
     parser.add_argument("--cosine-lr", action="store_true")
     parser.add_argument("--warmup-epochs", type=int, default=0)
     return parser.parse_args()
-
 
 def choose_device(name):
     if name == "auto":
@@ -770,6 +937,7 @@ def main():
             all_rows.extend(rows)
 
     save_csv(all_rows, output_dir)
+    save_summary(all_rows, output_dir)
     plot_results(all_rows, output_dir)
     print("Done.")
 
