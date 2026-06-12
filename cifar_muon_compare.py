@@ -16,8 +16,10 @@ Quick correctness check:
 import argparse
 import copy
 import csv
+import json
 import math
 import os
+import platform
 import random
 import time
 from dataclasses import dataclass
@@ -605,6 +607,7 @@ def cuda_memory_mb(device):
 
 @dataclass
 class RunResult:
+    seed: int
     dataset: str
     optimizer: str
     epoch: int
@@ -636,7 +639,7 @@ def run_warmup(model, train_loader, criterion, optimizer, device, args):
     sync_device(device)
 
 
-def run_one_experiment(dataset, optimizer_name, base_state, args, device, output_dir):
+def run_one_experiment(seed, dataset, optimizer_name, base_state, args, device, output_dir):
     train_loader, test_loader, num_classes = load_data(
         dataset=dataset,
         batch_size=args.batch_size,
@@ -664,8 +667,11 @@ def run_one_experiment(dataset, optimizer_name, base_state, args, device, output
         torch.cuda.reset_peak_memory_stats(device)
 
     rows = []
-    best_acc = 0.0
+    best_acc = -1.0
+    best_epoch = 0
     start = time.time()
+    best_ckpt_path = output_dir / f"seed{seed}_{dataset}_{optimizer_name}_best.pt"
+
     for epoch in range(1, args.epochs + 1):
         reset_optimizer_lr(optimizer, optimizer_name, args)
         if args.cosine_lr:
@@ -698,9 +704,25 @@ def run_one_experiment(dataset, optimizer_name, base_state, args, device, output
         epoch_time = time.time() - epoch_start
         elapsed_time = time.time() - start
         peak_memory = cuda_memory_mb(device)
-        best_acc = max(best_acc, test_acc)
+
+        if test_acc > best_acc:
+            best_acc = test_acc
+            best_epoch = epoch
+            if not args.no_save_model:
+                torch.save(
+                    {
+                        "seed": seed,
+                        "dataset": dataset,
+                        "optimizer": optimizer_name,
+                        "epoch": epoch,
+                        "test_acc": test_acc,
+                        "model_state": model.state_dict(),
+                    },
+                    best_ckpt_path,
+                )
 
         row = RunResult(
+            seed=seed,
             dataset=dataset,
             optimizer=optimizer_name,
             epoch=epoch,
@@ -717,17 +739,28 @@ def run_one_experiment(dataset, optimizer_name, base_state, args, device, output
         rows.append(row)
 
         print(
-            f"{dataset:8s} | {optimizer_name:10s} | epoch {epoch:03d}/{args.epochs:03d} | "
+            f"seed {seed:<5d} | {dataset:8s} | {optimizer_name:10s} | epoch {epoch:03d}/{args.epochs:03d} | "
             f"train loss {train_loss:.4f} | train acc {train_acc:6.2f}% | "
             f"test loss {test_loss:.4f} | test acc {test_acc:6.2f}% | "
             f"{epoch_time:6.1f}s | peak {peak_memory:7.1f} MB | skipped {skipped:2d} | "
             f"lr {row.lr}"
         )
 
-    ckpt_path = output_dir / f"{dataset}_{optimizer_name}_last.pt"
+    last_ckpt_path = output_dir / f"seed{seed}_{dataset}_{optimizer_name}_last.pt"
     if not args.no_save_model:
-        torch.save(model.state_dict(), ckpt_path)
-    print(f"{dataset} / {optimizer_name}: best test acc = {best_acc:.2f}%")
+        torch.save(
+            {
+                "seed": seed,
+                "dataset": dataset,
+                "optimizer": optimizer_name,
+                "epoch": args.epochs,
+                "best_epoch": best_epoch,
+                "best_test_acc": best_acc,
+                "model_state": model.state_dict(),
+            },
+            last_ckpt_path,
+        )
+    print(f"seed {seed} / {dataset} / {optimizer_name}: best test acc = {best_acc:.2f}% at epoch {best_epoch}")
     return rows
 
 
@@ -746,8 +779,8 @@ def summarize_rows(rows):
     summary = []
     grouped = {}
     for row in rows:
-        grouped.setdefault((row.dataset, row.optimizer), []).append(row)
-    for (dataset, optimizer), opt_rows in grouped.items():
+        grouped.setdefault((row.seed, row.dataset, row.optimizer), []).append(row)
+    for (seed, dataset, optimizer), opt_rows in grouped.items():
         opt_rows = sorted(opt_rows, key=lambda r: r.epoch)
         best = max(opt_rows, key=lambda r: r.test_acc)
         final = opt_rows[-1]
@@ -755,6 +788,7 @@ def summarize_rows(rows):
         final_loss = final.train_loss
         summary.append(
             {
+                "seed": seed,
                 "dataset": dataset,
                 "optimizer": optimizer,
                 "best_epoch": best.epoch,
@@ -784,6 +818,47 @@ def save_summary(rows, output_dir):
     print(f"Saved summary: {path}")
 
 
+def save_summary_mean_std(rows, output_dir):
+    summary = summarize_rows(rows)
+    if not summary:
+        return
+    metric_names = [
+        "best_test_acc",
+        "final_test_acc",
+        "final_train_loss",
+        "train_loss_drop",
+        "total_time",
+        "avg_epoch_time",
+        "peak_memory_mb",
+        "skipped_batches",
+    ]
+    grouped = {}
+    for item in summary:
+        grouped.setdefault((item["dataset"], item["optimizer"]), []).append(item)
+
+    out_rows = []
+    for (dataset, optimizer), items in grouped.items():
+        out = {
+            "dataset": dataset,
+            "optimizer": optimizer,
+            "num_seeds": len(items),
+            "seeds": " ".join(str(item["seed"]) for item in items),
+        }
+        for metric in metric_names:
+            values = np.array([float(item[metric]) for item in items], dtype=np.float64)
+            out[f"{metric}_mean"] = values.mean().item()
+            out[f"{metric}_std"] = values.std(ddof=1).item() if len(values) > 1 else 0.0
+        out_rows.append(out)
+
+    path = output_dir / "summary_mean_std.csv"
+    fieldnames = list(out_rows[0].keys())
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(out_rows)
+    print(f"Saved seed mean/std summary: {path}")
+
+
 def plot_results(rows, output_dir):
     if not rows:
         return
@@ -796,18 +871,34 @@ def plot_results(rows, output_dir):
         axes = axes.ravel()
         best_labels = []
         best_values = []
+        best_errors = []
 
         for optimizer_name, opt_rows in by_optimizer.items():
-            opt_rows = sorted(opt_rows, key=lambda r: r.epoch)
-            epochs = [r.epoch for r in opt_rows]
-            axes[0].plot(epochs, [r.train_loss for r in opt_rows], marker="o", label=optimizer_name)
-            axes[1].plot(epochs, [r.test_loss for r in opt_rows], marker="o", label=optimizer_name)
-            axes[2].plot(epochs, [r.train_acc for r in opt_rows], marker="o", linestyle="--", label=f"{optimizer_name} train")
-            axes[2].plot(epochs, [r.test_acc for r in opt_rows], marker="o", label=f"{optimizer_name} test")
-            axes[3].plot(epochs, [r.epoch_time for r in opt_rows], marker="o", label=optimizer_name)
-            axes[4].plot(epochs, [r.peak_memory_mb for r in opt_rows], marker="o", label=optimizer_name)
+            by_epoch = {}
+            for row in opt_rows:
+                by_epoch.setdefault(row.epoch, []).append(row)
+            epochs = sorted(by_epoch)
+            train_loss_mean = [np.mean([r.train_loss for r in by_epoch[e]]) for e in epochs]
+            test_loss_mean = [np.mean([r.test_loss for r in by_epoch[e]]) for e in epochs]
+            train_acc_mean = [np.mean([r.train_acc for r in by_epoch[e]]) for e in epochs]
+            test_acc_mean = [np.mean([r.test_acc for r in by_epoch[e]]) for e in epochs]
+            epoch_time_mean = [np.mean([r.epoch_time for r in by_epoch[e]]) for e in epochs]
+            memory_mean = [np.mean([r.peak_memory_mb for r in by_epoch[e]]) for e in epochs]
+
+            axes[0].plot(epochs, train_loss_mean, marker="o", label=optimizer_name)
+            axes[1].plot(epochs, test_loss_mean, marker="o", label=optimizer_name)
+            axes[2].plot(epochs, train_acc_mean, marker="o", linestyle="--", label=f"{optimizer_name} train")
+            axes[2].plot(epochs, test_acc_mean, marker="o", label=f"{optimizer_name} test")
+            axes[3].plot(epochs, epoch_time_mean, marker="o", label=optimizer_name)
+            axes[4].plot(epochs, memory_mean, marker="o", label=optimizer_name)
+
+            seed_bests = []
+            for seed in sorted({r.seed for r in opt_rows}):
+                seed_rows = [r for r in opt_rows if r.seed == seed]
+                seed_bests.append(max(r.test_acc for r in seed_rows))
             best_labels.append(optimizer_name)
-            best_values.append(max(r.test_acc for r in opt_rows))
+            best_values.append(float(np.mean(seed_bests)))
+            best_errors.append(float(np.std(seed_bests, ddof=1)) if len(seed_bests) > 1 else 0.0)
 
         titles = [
             f"{dataset.upper()} Train Loss",
@@ -824,7 +915,13 @@ def plot_results(rows, output_dir):
             ax.set_ylabel(ylabel)
             ax.grid(True, alpha=0.3)
 
-        axes[5].bar(best_labels, best_values, color=["#4c78a8", "#f58518", "#54a24b"][: len(best_labels)])
+        axes[5].bar(
+            best_labels,
+            best_values,
+            yerr=best_errors,
+            capsize=4,
+            color=["#4c78a8", "#f58518", "#54a24b"][: len(best_labels)],
+        )
         for idx, value in enumerate(best_values):
             axes[5].text(idx, value, f"{value:.2f}%", ha="center", va="bottom", fontsize=9)
         axes[0].legend()
@@ -839,6 +936,27 @@ def plot_results(rows, output_dir):
         plt.close(fig)
         print(f"Saved detailed plot: {path}")
 
+
+def save_config(args, device, output_dir, param_counts):
+    config = {
+        "args": vars(args),
+        "device": str(device),
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "python_version": platform.python_version(),
+        "torch_version": torch.__version__,
+        "torchvision_version": torchvision.__version__,
+        "param_counts": param_counts,
+        "notes": {
+            "optimizer_implementation": "manual parameter updates, no torch.optim",
+            "muon_param_rule": "param.ndim >= 2 uses Muon; vector/scalar params use AdamW",
+        },
+    }
+    path = output_dir / "config.json"
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    print(f"Saved config: {path}")
+
 def parse_args():
     parser = argparse.ArgumentParser(description="CIFAR-10/100 manual optimizer comparison")
     parser.add_argument("--datasets", nargs="+", default=["cifar10", "cifar100"], choices=["cifar10", "cifar100"])
@@ -848,7 +966,8 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=42, help="Single-seed shortcut kept for compatibility")
+    parser.add_argument("--seeds", nargs="+", type=int, default=None, help="Run multiple random seeds and report mean/std")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--fake-data", action="store_true", help="Use FakeData for quick code-path tests")
     parser.add_argument("--limit-train-batches", type=int, default=None)
@@ -896,7 +1015,11 @@ def choose_device(name):
 
 def main():
     args = parse_args()
-    set_seed(args.seed)
+    if args.seeds is None:
+        args.seeds = [args.seed]
+    else:
+        args.seed = args.seeds[0]
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     device = choose_device(args.device)
@@ -907,37 +1030,54 @@ def main():
     print(f"Device: {device}")
     print(f"Datasets: {', '.join(args.datasets)}")
     print(f"Optimizers: {', '.join(args.optimizers)}")
+    print(f"Seeds: {args.seeds}")
     print(f"Epochs: {args.epochs}, batch size: {args.batch_size}, fake data: {args.fake_data}")
     print(f"Model: CIFARResNet width={args.width}, blocks={tuple(args.blocks)}")
 
-    base_state = {}
+    param_counts = {}
     for num_classes in sorted({10 if d == "cifar10" else 100 for d in args.datasets}):
-        set_seed(args.seed)
         model = CIFARResNet(
             num_classes=num_classes,
             width=args.width,
             blocks=tuple(args.blocks),
             dropout=args.dropout,
         )
-        base_state[num_classes] = copy.deepcopy(model.state_dict())
-        print(f"Initial model for {num_classes} classes: {count_parameters(model):,} trainable params")
+        param_counts[str(num_classes)] = count_parameters(model)
+        print(f"Initial model for {num_classes} classes: {param_counts[str(num_classes)]:,} trainable params")
+    save_config(args, device, output_dir, param_counts)
 
     all_rows = []
-    for dataset in args.datasets:
-        for optimizer_name in args.optimizers:
-            set_seed(args.seed)
-            rows = run_one_experiment(
-                dataset=dataset,
-                optimizer_name=optimizer_name,
-                base_state=base_state,
-                args=args,
-                device=device,
-                output_dir=output_dir,
+    for seed in args.seeds:
+        print("-" * 80)
+        print(f"Starting seed {seed}")
+        base_state = {}
+        for num_classes in sorted({10 if d == "cifar10" else 100 for d in args.datasets}):
+            set_seed(seed)
+            model = CIFARResNet(
+                num_classes=num_classes,
+                width=args.width,
+                blocks=tuple(args.blocks),
+                dropout=args.dropout,
             )
-            all_rows.extend(rows)
+            base_state[num_classes] = copy.deepcopy(model.state_dict())
+
+        for dataset in args.datasets:
+            for optimizer_name in args.optimizers:
+                set_seed(seed)
+                rows = run_one_experiment(
+                    seed=seed,
+                    dataset=dataset,
+                    optimizer_name=optimizer_name,
+                    base_state=base_state,
+                    args=args,
+                    device=device,
+                    output_dir=output_dir,
+                )
+                all_rows.extend(rows)
 
     save_csv(all_rows, output_dir)
     save_summary(all_rows, output_dir)
+    save_summary_mean_std(all_rows, output_dir)
     plot_results(all_rows, output_dir)
     print("Done.")
 
