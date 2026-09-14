@@ -1,4 +1,24 @@
-# CIFAR-10 / CIFAR-100 Optimizer Comparison
+# CIFAR Optimizer Lab
+
+**手写优化器对比实验 · PyTorch · CIFAR-10 / CIFAR-100**
+
+[核心实现](cifar_muon_compare.py) · [快速验证](#1-先测试代码功能) · [实验输出](#5-输出文件)
+
+## 项目亮点
+
+- 在固定模型下比较 SGD、AdamW 与 Muon-AdamW 的参数更新。
+- 支持多随机种子、训练曲线、耗时与显存记录。
+- 将功能验证与正式实验分开，便于复现与解释结果。
+
+## 安装依赖
+
+```bash
+python -m pip install torch torchvision numpy matplotlib
+```
+
+以上为代码直接依赖；GPU 环境需使用与本机 CUDA 环境兼容的 PyTorch 安装版本。
+
+## 实验设计
 
 这个项目用于在 CIFAR-10 和 CIFAR-100 上比较同一个图像分类模型在三种手写优化器下的表现：
 
@@ -66,7 +86,7 @@ python cifar_muon_compare.py \
 
 ## 3. 8GB 显卡正式实验建议
 
-你的显卡是 8GB，所以建议优先保证完整实验能跑完，而不是一开始把模型宽度拉满。
+以下配置面向 8GB 显存设备，实际可用规模取决于运行环境。建议先完成小规模验证，再增加模型宽度。
 
 推荐先从下面这组单 seed 正式实验开始：
 
@@ -190,3 +210,4 @@ CIFAR-10 和 CIFAR-100 图片尺寸相同，显存差距主要不来自数据集
 - CIFAR-10 和 CIFAR-100 上差距是否一致。
 
 不要用假数据结果判断优化器优劣；假数据只用来验证代码功能。
+
